@@ -128,7 +128,6 @@ def main():
     embedding_size = 128
     filter_num = 32
     out_dim = 1
-    n_folds = 5
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -146,84 +145,66 @@ def main():
         ))
 
         dataset_path = os.path.join(data_root, dataset)
-        full_train_set = MultiGraphDataset(dataset_path, split="train")
 
-        # 5-fold
-        indices = np.arange(len(full_train_set))
-        np.random.seed(42)
-        np.random.shuffle(indices)
-        folds = np.array_split(indices, n_folds)
+        train_set = MultiGraphDataset(dataset_path, split="train")
+        val_set = MultiGraphDataset(dataset_path, split="test")
 
-        fold_best_epochs = []
-        fold_best_cis = []
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-        for fold in range(n_folds):
-            print(f"\n========== Fold {fold+1}/{n_folds} ==========")
+        csv_path = os.path.join(logger.get_model_dir(), "metrics.csv")
 
-            val_idx = folds[fold]
-            train_idx = np.hstack([folds[i] for i in range(n_folds) if i != fold])
+        model = MSADF_DTA(3, 26, embedding_size=embedding_size,
+                          filter_num=filter_num, out_dim=out_dim).to(device)
 
-            train_set = torch.utils.data.Subset(full_train_set, train_idx)
-            val_set = torch.utils.data.Subset(full_train_set, val_idx)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.MSELoss()
 
-            train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-            val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+        best_val_loss = float("inf")
 
-            fold_csv_path = os.path.join(logger.get_model_dir(), f"fold{fold+1}_metrics.csv")
-
-            model = MSADF_DTA(3, 26, embedding_size=embedding_size,
-                              filter_num=filter_num, out_dim=out_dim).to(device)
-
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-            criterion = nn.MSELoss()
-
-            best_val_loss = float("inf")
-
-            best_state = None
+        best_state = None
 
 
-            for epoch in range(1, epochs + 1):
-                model.train()
-                running_loss = AverageMeter()
-                running_ci = AverageMeter()
+        for epoch in range(1, epochs + 1):
+            model.train()
+            running_loss = AverageMeter()
+            running_ci = AverageMeter()
 
-                for atomic, brics, target, y in train_loader:
-                    atomic, brics = atomic.to(device), brics.to(device)
-                    target, y = target.to(device), y.to(device)
+            for atomic, brics, target, y in train_loader:
+                atomic, brics = atomic.to(device), brics.to(device)
+                target, y = target.to(device), y.to(device)
 
-                    optimizer.zero_grad()
-                    pred = model(atomic, brics, target)
-                    loss = criterion(pred.view(-1), y.view(-1))
-                    loss.backward()
-                    optimizer.step()
+                optimizer.zero_grad()
+                pred = model(atomic, brics, target)
+                loss = criterion(pred.view(-1), y.view(-1))
+                loss.backward()
+                optimizer.step()
 
-                    running_loss.update(loss.item(), y.size(0))
-                    running_ci.update(
-                        get_cindex(
-                            y.detach().cpu().numpy().reshape(-1),
-                            pred.detach().cpu().numpy().reshape(-1)
-                        ),
-                        y.size(0)
-                    )
+                running_loss.update(loss.item(), y.size(0))
+                running_ci.update(
+                    get_cindex(
+                        y.detach().cpu().numpy().reshape(-1),
+                        pred.detach().cpu().numpy().reshape(-1)
+                    ),
+                    y.size(0)
+                )
 
-                val_loss, val_ci = val(model, criterion, val_loader, device)
+            val_loss, val_ci = val(model, criterion, val_loader, device)
 
-                save_log_csv(fold_csv_path, epoch,
-                             running_loss.get_average(),
-                             running_ci.get_average(),
-                             val_loss, val_ci)
+            save_log_csv(csv_path, epoch,
+                         running_loss.get_average(),
+                         running_ci.get_average(),
+                         val_loss, val_ci)
 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
 
-                    best_state = model.state_dict()
+                best_state = model.state_dict()
 
-            fold_best_cis.append(val_ci)
+        torch.save(best_state,
+                   os.path.join(logger.get_model_dir(), "best_model.pt"))
 
-            torch.save(best_state,
-                       os.path.join(logger.get_model_dir(), f"fold{fold+1}_best.pt"))
-
-            print(f"[Fold {fold+1}] val_loss={best_val_loss:.4f}, val_ci={val_ci:.4f}")
+        print(f"[Best] val_loss={best_val_loss:.4f}")
 
 
 if __name__ == "__main__":
